@@ -1,118 +1,125 @@
-# Real-Time ASL Phrase Prediction (Two-Hand Version) using TensorFlow
-
 import cv2
-import mediapipe as mp
 import numpy as np
+import mediapipe as mp
 import tensorflow as tf
-from collections import deque
+from collections import deque, Counter
 
-# === Paths ===
-MODEL_PATH = r"C:\Users\JamJayDatuin\Documents\Machine Learning Projects\SignLanguageRecognition\models\ASLDatasetModels\ASL_Dataset.keras"
-LABEL_PATH = r"C:\Users\JamJayDatuin\Documents\Machine Learning Projects\SignLanguageRecognition\dataset\ASL\ASL_Dataset_Classes.npy"
+# =============================================
+#              CONFIG
+# =============================================
+SEQ_LEN = 50
+PREDICT_EVERY = 2
+SMOOTH_WINDOW = 8
 
-# === Load model and labels ===
-print("📦 Loading TensorFlow model...")
+# =============================================
+#              PATHS
+# =============================================
+MODEL_PATH = r"C:\Users\JamJayDatuin\Documents\Machine Learning Projects\SignLanguageRecognition\models\Sign_Model.keras"
+CLASSES_PATH = r"C:\Users\JamJayDatuin\Documents\Machine Learning Projects\SignLanguageRecognition\models\classes.npy"
+
+# =============================================
+#              LOAD MODEL + LABELS
+# =============================================
+print("Loading Keras model...")
 model = tf.keras.models.load_model(MODEL_PATH)
-label_classes = np.load(LABEL_PATH, allow_pickle=True)
-print(f"✅ Loaded model with {len(label_classes)} output labels")
 
-# === MediaPipe Setup ===
+classes = np.load(CLASSES_PATH, allow_pickle=True)
+print("Loaded classes:", classes)
+num_classes = len(classes)
+
+# =============================================
+#              MEDIAPIPE SETUP
+# =============================================
 mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
+mp_draw = mp.solutions.drawing_utils
+hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.5)
 
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=2,                 # ✅ Allow both hands
-    min_detection_confidence=0.6,
-    min_tracking_confidence=0.6
-)
+# =============================================
+#              BUFFERS
+# =============================================
+sequence = deque(maxlen=SEQ_LEN)
+predictions_smooth = deque(maxlen=SMOOTH_WINDOW)
+recognized_sentence = []
 
-# === Helper: Extract both-hand keypoints (126 features = 2 × 21 × 3) ===
-def extract_two_hand_keypoints(results):
-    left_hand = np.zeros(21 * 3)
-    right_hand = np.zeros(21 * 3)
-
-    if results.multi_hand_landmarks and results.multi_handedness:
-        for hand_idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
-            label = results.multi_handedness[hand_idx].classification[0].label
-            coords = []
-            for lm in hand_landmarks.landmark:
-                coords.extend([lm.x, lm.y, lm.z])
-
-            if label.lower() == 'left':
-                left_hand = np.array(coords)
-            else:
-                right_hand = np.array(coords)
-
-    # Always return fixed-length 126-dim vector
-    return np.concatenate([left_hand, right_hand])
-
-# === Prediction Smoothing ===
-predictions_queue = deque(maxlen=10)
-
-# === Start Webcam ===
 cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("🚫 Cannot access webcam.")
-    exit()
+frame_count = 0
 
-print("🎥 Starting webcam... Press 'q' to quit.")
-print("🖐 Show both hands clearly to the camera.")
+# =============================================
+#              PREDICTION FUNCTION
+# =============================================
+def predict_label(window):
+    array = np.array(window, dtype=np.float32).reshape(1, SEQ_LEN, 126)
+    probs = model.predict(array, verbose=0)
+    idx = np.argmax(probs)
+    return classes[idx], float(probs[0][idx])
+
+
+# =============================================
+#         🔵 REAL-TIME LOOP
+# =============================================
+print("🎥 ASL+FSL Mixed Prediction Started...")
 
 while True:
     ret, frame = cap.read()
     if not ret:
-        print("⚠️ Frame capture failed, skipping...")
-        continue
+        break
 
-    # Flip and preprocess
     frame = cv2.flip(frame, 1)
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(rgb)
 
-    # === Extract hand features (always 126 features) ===
-    features = extract_two_hand_keypoints(results).reshape(1, -1)
+    left = np.zeros(63)
+    right = np.zeros(63)
 
-    # === Predict if at least one hand is detected ===
-    if np.any(features):
-        probs = model.predict(features, verbose=0)
-        pred_idx = np.argmax(probs)
-        pred_label = label_classes[pred_idx]
-        confidence = probs[0][pred_idx]
+    if not (results.multi_hand_landmarks and results.multi_handedness):
+        cv2.putText(frame, "No Hands Detected", (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+        cv2.imshow("ASL+FSL Recognition", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+        continue
 
-        predictions_queue.append(pred_label)
-        stable_prediction = max(set(predictions_queue), key=predictions_queue.count)
+    for i, hand in enumerate(results.multi_hand_landmarks):
+        hand_label = results.multi_handedness[i].classification[0].label.lower()
+        coords = []
 
-        # Display text
-        cv2.putText(frame,
-                    f"{stable_prediction} ({confidence*100:.1f}%)",
-                    (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-                    (0, 255, 0), 2)
-    else:
-        cv2.putText(frame, "No Hands Detected",
-                    (20, 50), cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0, (0, 0, 255), 2)
+        for lm in hand.landmark:
+            coords.extend([lm.x, lm.y, lm.z])
 
-    # === Draw landmarks for both hands ===
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-            mp_drawing.draw_landmarks(
-                frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
-                mp_drawing.DrawingSpec(color=(0, 255, 0),
-                                       thickness=2, circle_radius=3),
-                mp_drawing.DrawingSpec(color=(255, 0, 0),
-                                       thickness=2)
-            )
+        if hand_label == "left":
+            left = np.array(coords)
+        else:
+            right = np.array(coords)
 
-    # Show live frame
-    cv2.imshow("ASL Phrase Recognition (TensorFlow Two-Hand)", frame)
+        mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
 
-    # Exit condition
+    sequence.append(np.concatenate([left, right]))
+
+    frame_count += 1
+
+    if len(sequence) == SEQ_LEN and frame_count % PREDICT_EVERY == 0:
+
+        label, conf = predict_label(sequence)
+        predictions_smooth.append(label)
+
+        stable_label = Counter(predictions_smooth).most_common(1)[0][0]
+
+        # PRINT TO TERMINAL ONLY
+        print(f"Predicted: {label} | Confidence: {conf*100:.2f}% | Stable: {stable_label}")
+
+        if len(recognized_sentence) == 0 or stable_label != recognized_sentence[-1]:
+            recognized_sentence.append(stable_label)
+
+    cv2.putText(frame, " ".join(recognized_sentence[-7:]),
+                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+
+    cv2.imshow("ASL+FSL Recognition", frame)
+
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# === Cleanup ===
 cap.release()
 cv2.destroyAllWindows()
-hands.close()
-print("🛑 Webcam closed.")
+
+print("\nFinal Recognized Gloss Sequence:")
+print(recognized_sentence)

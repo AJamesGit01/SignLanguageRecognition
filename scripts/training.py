@@ -1,85 +1,114 @@
-import os
-import glob
-import pandas as pd
 import numpy as np
+import pandas as pd
+import glob
+import os
 import tensorflow as tf
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-from tensorflow.keras import layers, models
 
-# === 1️⃣ Dataset Loading & Combining ===
-DATA_DIR = r"C:\Users\JamJayDatuin\Documents\Machine Learning Projects\SignLanguageRecognition\dataset\FSL"
-all_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
+# =============================================
+#        📁 BASE PATHS
+# =============================================
+BASE_DIR = r"C:\Users\JamJayDatuin\Documents\Machine Learning Projects\SignLanguageRecognition"
+ASL_DIR = os.path.join(BASE_DIR, "dataset", "ASL")
+FSL_DIR = os.path.join(BASE_DIR, "dataset", "FSL")
+MODELS_DIR = os.path.join(BASE_DIR, "models")
 
-print(f"📁 Found {len(all_files)} dataset files")
-
-# Load ALL .csv files inside the ASL/FSL folder
-all_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
-
-print(f"📁 Found {len(all_files)} dataset files")
-print("Files:", [os.path.basename(f) for f in all_files])
-
-df_list = []
-for file in all_files:
-    try:
-        df = pd.read_csv(file)
-        if df.empty:
-            print(f"⚠️ Skipped empty file: {os.path.basename(file)}")
-            continue
-
-        # Add label automatically based on filename
-        df['label'] = os.path.splitext(os.path.basename(file))[0]
-
-        df_list.append(df)
-        print(f"✅ Loaded {os.path.basename(file)} ({df.shape[0]} samples)")
-    except Exception as e:
-        print(f"❌ Error reading {os.path.basename(file)}: {e}")
-
-# Combine all
-if not df_list:
-    raise ValueError("🚫 No valid datasets found. Make sure CSV files are present.")
-
-final_df = pd.concat(df_list, ignore_index=True)
-
-combined_path = os.path.join(DATA_DIR, "FSLdataset.csv")
-final_df.to_csv(combined_path, index=False)
-
-print("\n✅ Combined dataset created successfully!")
-print(f"📄 Saved to: {combined_path}")
-print("🧮 Total samples:", final_df.shape[0])
-print("🏷️ Unique labels:", final_df['label'].unique())
+os.makedirs(MODELS_DIR, exist_ok=True)
 
 
-# === 2️⃣ Preprocessing ===
-print("\n🔧 Cleaning and preparing data...")
+# =============================================
+#        🔄 LOAD ASL + FSL WITHOUT PREFIXES
+# =============================================
+def load_dataset(folder_path):
+    files = glob.glob(os.path.join(folder_path, "*.csv"))
+    dfs = []
+    for f in files:
+        df = pd.read_csv(f)
+        dfs.append(df)
+    return dfs
 
-# Drop NaNs and ensure numeric
-final_df = final_df.dropna()
-X = final_df.drop('label', axis=1)
-X = X.apply(pd.to_numeric, errors='coerce').fillna(0).values
+asl_dfs = load_dataset(ASL_DIR)
+fsl_dfs = load_dataset(FSL_DIR)
+
+df = pd.concat(asl_dfs + fsl_dfs, ignore_index=True)
+
+print(f"📌 Loaded ASL files: {len(asl_dfs)}")
+print(f"📌 Loaded FSL files: {len(fsl_dfs)}")
+print(f"📌 Total merged samples: {len(df)}")
+
+
+# =============================================
+#        🎯 SEPARATE LABELS + FEATURES
+# =============================================
+labels = df['label']
+df = df.drop('label', axis=1)
+
+SEQ_LEN = 50
+FEATURES = 126
+
+# Reshape dataset
+X = df.values.reshape(len(df), SEQ_LEN, FEATURES)
 
 # Encode labels
-label_encoder = LabelEncoder()
-y = label_encoder.fit_transform(final_df['label'])
+le = LabelEncoder()
+y = le.fit_transform(labels)
 
-# Save label encoder for later decoding
-np.save(os.path.join(DATA_DIR, "ObjectThings_classes.npy"), label_encoder.classes_)
-print("💾 Saved label classes for later decoding")
+print("\n📌 Combined Classes:", list(le.classes_))
+print("📌 Total Classes:", len(le.classes_))
 
-# Split data
+# Save the merged classes list
+np.save(os.path.join(MODELS_DIR, "classes.npy"), le.classes_)
+
+
+# =============================================
+#        ✂️ TRAIN / TEST SPLIT
+# =============================================
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
+    X, y, test_size=0.2, random_state=42, shuffle=True
 )
 
-# === 3️⃣ Build TensorFlow Model ===
-print("\n🧠 Building TensorFlow Model...")
 
-model = models.Sequential([
-    layers.Input(shape=(X_train.shape[1],)),
-    layers.Dense(128, activation='relu'),
-    layers.Dropout(0.3),
-    layers.Dense(64, activation='relu'),
-    layers.Dense(len(np.unique(y)), activation='softmax')
+# =============================================
+#        💾 SAVE PROCESSED DATASETS TO ASL/FSL
+# =============================================
+def save_processed(folder, X_train, X_test, y_train, y_test, classes):
+    processed = os.path.join(folder, "processed")
+    os.makedirs(processed, exist_ok=True)
+
+    np.save(os.path.join(processed, "X_train.npy"), X_train)
+    np.save(os.path.join(processed, "X_test.npy"), X_test)
+    np.save(os.path.join(processed, "y_train.npy"), y_train)
+    np.save(os.path.join(processed, "y_test.npy"), y_test)
+    np.save(os.path.join(processed, "classes.npy"), classes)
+
+    print(f"💾 Saved processed dataset → {processed}")
+
+save_processed(ASL_DIR, X_train, X_test, y_train, y_test, le.classes_)
+save_processed(FSL_DIR, X_train, X_test, y_train, y_test, le.classes_)
+
+
+# =============================================
+#     🚀 TFLITE-FRIENDLY GRU MODEL
+# =============================================
+model = tf.keras.Sequential([
+
+    tf.keras.layers.Conv1D(
+        64, 3, padding='same', activation='relu',
+        input_shape=(SEQ_LEN, FEATURES)
+    ),
+
+    tf.keras.layers.DepthwiseConv1D(3, padding='same', activation='relu'),
+
+    tf.keras.layers.MaxPooling1D(2),
+
+    tf.keras.layers.GRU(128, return_sequences=True),
+    tf.keras.layers.GRU(64),
+
+    tf.keras.layers.Dropout(0.25),
+    tf.keras.layers.Dense(64, activation='relu'),
+
+    tf.keras.layers.Dense(len(le.classes_), activation='softmax')
 ])
 
 model.compile(
@@ -90,45 +119,50 @@ model.compile(
 
 model.summary()
 
-# === 4️⃣ Train Model ===
-print("\n🚀 Training model...")
+
+# =============================================
+#        🧠 TRAIN MODEL
+# =============================================
 history = model.fit(
     X_train, y_train,
     validation_split=0.2,
-    epochs=30,
-    batch_size=32,
-    verbose=1
+    epochs=40,
+    batch_size=32
 )
 
-# === 5️⃣ Evaluate ===
-print("\n📊 Evaluating model...")
-test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
-print(f"✅ Test Accuracy: {test_acc:.4f}")
-print(f"📉 Test Loss: {test_loss:.4f}")
 
-# === 6️⃣ Save Models (Keras, SavedModel, TFLite) ===
-TFMODELS_DIR = os.path.join(DATA_DIR, "FSLDatasetModels")
-os.makedirs(TFMODELS_DIR, exist_ok=True)
+# =============================================
+#        📊 EVALUATE MODEL
+# =============================================
+loss, acc = model.evaluate(X_test, y_test)
+print("\n📊 Test Accuracy:", acc)
 
-KERAS_PATH = os.path.join(TFMODELS_DIR, "FSL_Dataset.keras")
-SAVEDMODEL_PATH = os.path.join(TFMODELS_DIR, "FSL_Dataset_SavedModel")
-TFLITE_PATH = os.path.join(TFMODELS_DIR, "FSL_Dataset_Model.tflite")
 
-# Save .keras
-model.save(KERAS_PATH)
-print(f"💾 Saved Keras model → {KERAS_PATH}")
+# =============================================
+#        💾 SAVE MODELS
+# =============================================
+keras_path = os.path.join(MODELS_DIR, "Sign_Model.keras")
+model.save(keras_path)
+print("\n💾 Saved Keras model:", keras_path)
 
-# Save as TensorFlow SavedModel
-model.export(SAVEDMODEL_PATH)
-print(f"💾 Saved TensorFlow SavedModel → {SAVEDMODEL_PATH}")
 
-# Convert to TFLite
+# =============================================
+#        🚀 TFLITE CONVERSION
+# =============================================
 converter = tf.lite.TFLiteConverter.from_keras_model(model)
+
+converter.target_spec.supported_ops = [
+    tf.lite.OpsSet.TFLITE_BUILTINS,
+    tf.lite.OpsSet.SELECT_TF_OPS
+]
+
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+converter.target_spec.supported_types = [tf.float16]
+
 tflite_model = converter.convert()
 
-with open(TFLITE_PATH, "wb") as f:
+tflite_path = os.path.join(MODELS_DIR, "Sign_Model.tflite")
+with open(tflite_path, "wb") as f:
     f.write(tflite_model)
 
-print(f"💾 Saved TFLite model → {TFLITE_PATH}")
-
-print("\n✅ All models exported successfully!")
+print("\n💾 Saved TFLite model:", tflite_path)
