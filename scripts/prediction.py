@@ -3,6 +3,7 @@ import numpy as np
 import mediapipe as mp
 import tensorflow as tf
 from collections import deque, Counter
+import time
 
 # =============================================
 #              CONFIG
@@ -10,6 +11,8 @@ from collections import deque, Counter
 SEQ_LEN = 50
 PREDICT_EVERY = 2
 SMOOTH_WINDOW = 8
+CONF_THRESHOLD = 0.70        # NEW — minimum confidence
+COOLDOWN_FRAMES = 12         # NEW — avoid repeating same gloss
 
 # =============================================
 #              PATHS
@@ -40,9 +43,10 @@ hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.5)
 sequence = deque(maxlen=SEQ_LEN)
 predictions_smooth = deque(maxlen=SMOOTH_WINDOW)
 recognized_sentence = []
+frame_count = 0
+cooldown = 0     # NEW — cooldown timer
 
 cap = cv2.VideoCapture(0)
-frame_count = 0
 
 # =============================================
 #              PREDICTION FUNCTION
@@ -74,7 +78,9 @@ while True:
     if not (results.multi_hand_landmarks and results.multi_handedness):
         cv2.putText(frame, "No Hands Detected", (10, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
-        cv2.imshow("ASL+FSL Recognition", frame)
+
+        cooldown = max(0, cooldown - 1)  # cooldown still counts
+        cv2.imshow("ASL+FSL+SHARED Recognition", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
         continue
@@ -94,8 +100,10 @@ while True:
         mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
 
     sequence.append(np.concatenate([left, right]))
-
     frame_count += 1
+
+    if cooldown > 0:
+        cooldown -= 1
 
     if len(sequence) == SEQ_LEN and frame_count % PREDICT_EVERY == 0:
 
@@ -104,16 +112,34 @@ while True:
 
         stable_label = Counter(predictions_smooth).most_common(1)[0][0]
 
-        # PRINT TO TERMINAL ONLY
-        print(f"Predicted: {label} | Confidence: {conf*100:.2f}% | Stable: {stable_label}")
+        # 💡 Confidence filter (NEW)
+        if conf < CONF_THRESHOLD:
+            stable_label = "..."
 
-        if len(recognized_sentence) == 0 or stable_label != recognized_sentence[-1]:
+        # Print to terminal (debug)
+        print(f"Predicted: {label} | Conf: {conf:.2f} | Stable: {stable_label} | Cooldown: {cooldown}")
+
+        # 💡 ADD TO SENTENCE IF:
+        #    - not in cooldown
+        #    - not "..."
+        #    - different from last added gloss
+        if cooldown == 0 and stable_label != "..." \
+           and (len(recognized_sentence) == 0 or stable_label != recognized_sentence[-1]):
+            
             recognized_sentence.append(stable_label)
+            cooldown = COOLDOWN_FRAMES  # reset cooldown
 
-    cv2.putText(frame, " ".join(recognized_sentence[-7:]),
-                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+    # Display current recognized gloss sequence
+    cv2.putText(frame, " ".join(recognized_sentence[-10:]),
+                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                (255, 255, 0), 2)
 
-    cv2.imshow("ASL+FSL Recognition", frame)
+    # Display current stable label
+    cv2.putText(frame, f"Stable: {stable_label} ({conf*100:.0f}%)",
+                (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                (0, 255, 0), 2)
+
+    cv2.imshow("ASL+FSL+SHARED Recognition", frame)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break

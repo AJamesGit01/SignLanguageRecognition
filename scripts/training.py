@@ -12,6 +12,7 @@ from sklearn.preprocessing import LabelEncoder
 BASE_DIR = r"C:\Users\JamJayDatuin\Documents\Machine Learning Projects\SignLanguageRecognition"
 ASL_DIR = os.path.join(BASE_DIR, "dataset", "ASL")
 FSL_DIR = os.path.join(BASE_DIR, "dataset", "FSL")
+SHARED_DIR = os.path.join(BASE_DIR, "dataset", "SHARED")
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -30,11 +31,13 @@ def load_dataset(folder_path):
 
 asl_dfs = load_dataset(ASL_DIR)
 fsl_dfs = load_dataset(FSL_DIR)
-
-df = pd.concat(asl_dfs + fsl_dfs, ignore_index=True)
+shared_dfs = load_dataset(SHARED_DIR)
+df = pd.concat(asl_dfs + fsl_dfs + shared_dfs, ignore_index=True)
 
 print(f"📌 Loaded ASL files: {len(asl_dfs)}")
 print(f"📌 Loaded FSL files: {len(fsl_dfs)}")
+print(f"📌 Loaded SHARED files: {len(shared_dfs)}")
+df = pd.concat(asl_dfs + fsl_dfs + shared_dfs, ignore_index=True)
 print(f"📌 Total merged samples: {len(df)}")
 
 
@@ -86,6 +89,7 @@ def save_processed(folder, X_train, X_test, y_train, y_test, classes):
 
 save_processed(ASL_DIR, X_train, X_test, y_train, y_test, le.classes_)
 save_processed(FSL_DIR, X_train, X_test, y_train, y_test, le.classes_)
+save_processed(SHARED_DIR, X_train, X_test, y_train, y_test, le.classes_)
 
 
 # =============================================
