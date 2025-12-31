@@ -17,29 +17,24 @@ MODELS_DIR = os.path.join(BASE_DIR, "models")
 
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-
 # =============================================
-#        🔄 LOAD ASL + FSL WITHOUT PREFIXES
+#        🔄 LOAD ASL + FSL + SHARED
 # =============================================
 def load_dataset(folder_path):
     files = glob.glob(os.path.join(folder_path, "*.csv"))
-    dfs = []
-    for f in files:
-        df = pd.read_csv(f)
-        dfs.append(df)
+    dfs = [pd.read_csv(f) for f in files]
     return dfs
 
 asl_dfs = load_dataset(ASL_DIR)
 fsl_dfs = load_dataset(FSL_DIR)
 shared_dfs = load_dataset(SHARED_DIR)
+
 df = pd.concat(asl_dfs + fsl_dfs + shared_dfs, ignore_index=True)
 
 print(f"📌 Loaded ASL files: {len(asl_dfs)}")
 print(f"📌 Loaded FSL files: {len(fsl_dfs)}")
 print(f"📌 Loaded SHARED files: {len(shared_dfs)}")
-df = pd.concat(asl_dfs + fsl_dfs + shared_dfs, ignore_index=True)
 print(f"📌 Total merged samples: {len(df)}")
-
 
 # =============================================
 #        🎯 SEPARATE LABELS + FEATURES
@@ -50,8 +45,15 @@ df = df.drop('label', axis=1)
 SEQ_LEN = 50
 FEATURES = 126
 
-# Reshape dataset
-X = df.values.reshape(len(df), SEQ_LEN, FEATURES)
+# Convert to float32 and reshape
+X = df.values.astype(np.float32).reshape(len(df), SEQ_LEN, FEATURES)
+
+# Compute velocity (frame-to-frame difference)
+vel = X[:, 1:, :] - X[:, :-1, :]
+vel = np.pad(vel, ((0,0),(1,0),(0,0)), mode='constant')
+X = np.concatenate([X, vel], axis=2)
+
+FEATURES = 252  # updated after concatenation
 
 # Encode labels
 le = LabelEncoder()
@@ -63,17 +65,30 @@ print("📌 Total Classes:", len(le.classes_))
 # Save the merged classes list
 np.save(os.path.join(MODELS_DIR, "classes.npy"), le.classes_)
 
-
 # =============================================
 #        ✂️ TRAIN / TEST SPLIT
 # =============================================
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, shuffle=True
+    X, y,
+    test_size=0.2,
+    random_state=42,
+    shuffle=True
 )
 
+# =============================================
+#        📏 NORMALIZATION (TRAIN-ONLY STATS)
+# =============================================
+mean = X_train.mean(axis=(0,1), keepdims=True).astype(np.float32)
+std = X_train.std(axis=(0,1), keepdims=True).astype(np.float32) + 1e-6
+
+X_train = ((X_train - mean) / std).astype(np.float32)
+X_test  = ((X_test - mean) / std).astype(np.float32)
+
+np.save(os.path.join(MODELS_DIR, "norm_mean.npy"), mean)
+np.save(os.path.join(MODELS_DIR, "norm_std.npy"), std)
 
 # =============================================
-#        💾 SAVE PROCESSED DATASETS TO ASL/FSL
+#        💾 SAVE PROCESSED DATASETS
 # =============================================
 def save_processed(folder, X_train, X_test, y_train, y_test, classes):
     processed = os.path.join(folder, "processed")
@@ -92,28 +107,29 @@ save_processed(FSL_DIR, X_train, X_test, y_train, y_test, le.classes_)
 save_processed(SHARED_DIR, X_train, X_test, y_train, y_test, le.classes_)
 
 
+
 # =============================================
 #     🚀 TFLITE-FRIENDLY GRU MODEL
 # =============================================
-model = tf.keras.Sequential([
 
-    tf.keras.layers.Conv1D(
-        64, 3, padding='same', activation='relu',
-        input_shape=(SEQ_LEN, FEATURES)
-    ),
+model = tf.keras.Sequential([
+    tf.keras.layers.Conv1D(64, 3, padding='same', activation='relu',
+                            input_shape=(SEQ_LEN, FEATURES)),
+    tf.keras.layers.BatchNormalization(),
 
     tf.keras.layers.DepthwiseConv1D(3, padding='same', activation='relu'),
+    tf.keras.layers.BatchNormalization(),
 
     tf.keras.layers.MaxPooling1D(2),
 
     tf.keras.layers.GRU(128, return_sequences=True),
     tf.keras.layers.GRU(64),
 
-    tf.keras.layers.Dropout(0.25),
+    tf.keras.layers.Dropout(0.3),
     tf.keras.layers.Dense(64, activation='relu'),
-
     tf.keras.layers.Dense(len(le.classes_), activation='softmax')
 ])
+
 
 model.compile(
     optimizer='adam',
