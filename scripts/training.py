@@ -107,34 +107,62 @@ save_processed(FSL_DIR, X_train, X_test, y_train, y_test, le.classes_)
 save_processed(SHARED_DIR, X_train, X_test, y_train, y_test, le.classes_)
 
 
-
 # =============================================
-#     🚀 TFLITE-FRIENDLY GRU MODEL
+#     🚀 PURE TFLITE-SAFE TEMPORAL MODEL
 # =============================================
 
 model = tf.keras.Sequential([
-    tf.keras.layers.Conv1D(64, 3, padding='same', activation='relu',
-                            input_shape=(SEQ_LEN, FEATURES)),
+    # --- Temporal feature extraction ---
+    tf.keras.layers.Conv1D(
+        filters=64,
+        kernel_size=3,
+        padding="same",
+        activation="relu",
+        input_shape=(SEQ_LEN, FEATURES)
+    ),
     tf.keras.layers.BatchNormalization(),
 
-    tf.keras.layers.DepthwiseConv1D(3, padding='same', activation='relu'),
+    tf.keras.layers.DepthwiseConv1D(
+        kernel_size=3,
+        padding="same",
+        activation="relu"
+    ),
     tf.keras.layers.BatchNormalization(),
 
-    tf.keras.layers.MaxPooling1D(2),
+    tf.keras.layers.MaxPooling1D(pool_size=2),
 
-    tf.keras.layers.GRU(128, return_sequences=True),
-    tf.keras.layers.GRU(64),
+    # --- Long-range temporal modeling (SAFE) ---
+    tf.keras.layers.Conv1D(
+        filters=128,
+        kernel_size=3,
+        dilation_rate=2,
+        padding="same",
+        activation="relu"
+    ),
+    tf.keras.layers.BatchNormalization(),
 
+    tf.keras.layers.Conv1D(
+        filters=128,
+        kernel_size=3,
+        dilation_rate=4,
+        padding="same",
+        activation="relu"
+    ),
+    tf.keras.layers.BatchNormalization(),
+
+    # --- Sequence aggregation (NO TensorList) ---
+    tf.keras.layers.GlobalAveragePooling1D(),
+
+    # --- Classifier ---
+    tf.keras.layers.Dense(128, activation="relu"),
     tf.keras.layers.Dropout(0.3),
-    tf.keras.layers.Dense(64, activation='relu'),
-    tf.keras.layers.Dense(len(le.classes_), activation='softmax')
+    tf.keras.layers.Dense(len(le.classes_), activation="softmax")
 ])
 
-
 model.compile(
-    optimizer='adam',
-    loss='sparse_categorical_crossentropy',
-    metrics=['accuracy']
+    optimizer="adam",
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"]
 )
 
 model.summary()
@@ -167,17 +195,17 @@ print("\n💾 Saved Keras model:", keras_path)
 
 
 # =============================================
-#        🚀 TFLITE CONVERSION
+#        🚀 TFLITE CONVERSION (FLOAT32)
 # =============================================
+
 converter = tf.lite.TFLiteConverter.from_keras_model(model)
 
-converter.target_spec.supported_ops = [
-    tf.lite.OpsSet.TFLITE_BUILTINS,
-    tf.lite.OpsSet.SELECT_TF_OPS
-]
+converter.optimizations = []
+converter.inference_input_type = tf.float32
+converter.inference_output_type = tf.float32
 
-converter.optimizations = [tf.lite.Optimize.DEFAULT]
-converter.target_spec.supported_types = [tf.float16]
+# ❌ No optimizations → keeps full precision
+# converter.optimizations = []
 
 tflite_model = converter.convert()
 
@@ -185,4 +213,5 @@ tflite_path = os.path.join(MODELS_DIR, "Sign_Model.tflite")
 with open(tflite_path, "wb") as f:
     f.write(tflite_model)
 
-print("\n💾 Saved TFLite model:", tflite_path)
+print("\n💾 Saved FLOAT32 TFLite model:", tflite_path)
+
