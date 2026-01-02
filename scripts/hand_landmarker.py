@@ -1,8 +1,14 @@
+# Prediction Script with Dominance-Based Stable Prediction
+
+
 import cv2
 import numpy as np
 import mediapipe as mp
 import tensorflow as tf
 from collections import deque
+
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 # =============================================
 # CONFIG
@@ -22,9 +28,10 @@ MODEL_PATH   = f"{BASE}\\Sign_Model.keras"
 CLASSES_PATH = f"{BASE}\\classes.npy"
 MEAN_PATH    = f"{BASE}\\norm_mean.npy"
 STD_PATH     = f"{BASE}\\norm_std.npy"
+TASK_PATH    = f"{BASE}\\hand_landmarker.task"
 
 # =============================================
-# LOAD MODEL + METADATA
+# LOAD MODEL
 # =============================================
 model = tf.keras.models.load_model(MODEL_PATH)
 classes = np.load(CLASSES_PATH, allow_pickle=True)
@@ -32,22 +39,29 @@ mean = np.load(MEAN_PATH)
 std = np.load(STD_PATH)
 
 # =============================================
-# MEDIAPIPE
+# MEDIAPIPE HAND LANDMARKER
 # =============================================
-mp_hands = mp.solutions.hands
-mp_draw  = mp.solutions.drawing_utils
-hands = mp_hands.Hands(
-    max_num_hands=2,
-    min_detection_confidence=0.5,
+BaseOptions = python.BaseOptions
+HandLandmarker = vision.HandLandmarker
+HandLandmarkerOptions = vision.HandLandmarkerOptions
+VisionRunningMode = vision.RunningMode
+
+options = HandLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=TASK_PATH),
+    running_mode=VisionRunningMode.VIDEO,
+    num_hands=2,
+    min_hand_detection_confidence=0.5,
+    min_hand_presence_confidence=0.5,
     min_tracking_confidence=0.5
 )
+
+hand_landmarker = HandLandmarker.create_from_options(options)
 
 # =============================================
 # BUFFERS
 # =============================================
 sequence = deque(maxlen=SEQ_LEN)
-prev_pos = None
-
+prev_frame = None
 recognized_sentence = []
 cooldown = 0
 frame_count = 0
@@ -56,11 +70,10 @@ dominance_counter = {}
 cap = cv2.VideoCapture(0)
 
 # =============================================
-# PREDICT FUNCTION (252 FEATURES)
+# PREDICT FUNCTION
 # =============================================
 def predict_label(window):
-    arr = np.array(window, dtype=np.float32)
-    arr = arr.reshape(1, SEQ_LEN, 252)
+    arr = np.array(window, dtype=np.float32).reshape(1, SEQ_LEN, 252)
     arr = (arr - mean) / std
     probs = model.predict(arr, verbose=0)[0]
     idx = np.argmax(probs)
@@ -69,7 +82,7 @@ def predict_label(window):
 # =============================================
 # REAL-TIME LOOP
 # =============================================
-print("🎥 Stable Dominance Prediction Running...")
+print("🎥 Dominance-Based Stable Prediction Started...")
 
 while True:
     ret, frame = cap.read()
@@ -78,48 +91,42 @@ while True:
 
     frame = cv2.flip(frame, 1)
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(rgb)
 
-    left = np.zeros(63, dtype=np.float32)
-    right = np.zeros(63, dtype=np.float32)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    timestamp_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC))
+    result = hand_landmarker.detect_for_video(mp_image, timestamp_ms)
 
-    # ---------------- NO HANDS ----------------
-    if not results.multi_hand_landmarks:
-        prev_pos = None
+    left = np.zeros(63)
+    right = np.zeros(63)
+
+    if result.hand_landmarks:
+        for i, hand_landmarks in enumerate(result.hand_landmarks):
+            handedness = result.handedness[i][0].category_name.lower()
+            coords = []
+            for lm in hand_landmarks:
+                coords.extend([lm.x, lm.y, lm.z])
+
+            if handedness == "left":
+                left = coords
+            else:
+                right = coords
+
+    else:
         cooldown = max(0, cooldown - 1)
-
-        cv2.putText(frame, "No Hands", (10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+        cv2.putText(frame, "No Hands Detected", (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         cv2.imshow("Recognition", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
         continue
 
-    # ---------------- LANDMARK EXTRACTION ----------------
-    for i, hand in enumerate(results.multi_hand_landmarks):
-        label = results.multi_handedness[i].classification[0].label.lower()
-        coords = []
-        for lm in hand.landmark:
-            coords.extend([lm.x, lm.y, lm.z])
+    # ---------------- FEATURE BUILD ----------------
+    pos = np.concatenate([left, right])
 
-        if label == "left":
-            left[:] = coords
-        else:
-            right[:] = coords
+    vel = np.zeros_like(pos) if prev_frame is None else pos - prev_frame
+    prev_frame = pos.copy()
 
-        mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
-
-    pos = np.concatenate([left, right])  # 126
-
-    # ---------------- VELOCITY ----------------
-    if prev_pos is None:
-        vel = np.zeros_like(pos)
-    else:
-        vel = pos - prev_pos
-
-    prev_pos = pos.copy()
-
-    full_feat = np.concatenate([pos, vel])  # 252
+    full_feat = np.concatenate([pos, vel])
     sequence.append(full_feat)
 
     frame_count += 1
@@ -131,12 +138,12 @@ while True:
 
         if conf >= CONF_THRESHOLD:
             dominance_counter[label] = dominance_counter.get(label, 0) + 1
-            dominant = max(dominance_counter, key=dominance_counter.get)
+            dominant_label = max(dominance_counter, key=dominance_counter.get)
 
-            if dominance_counter[dominant] >= DOMINANCE_THRESHOLD and cooldown == 0:
-                if not recognized_sentence or dominant != recognized_sentence[-1]:
-                    recognized_sentence.append(dominant)
-                    print(f"✔ ACCEPTED: {dominant}")
+            if dominance_counter[dominant_label] >= DOMINANCE_THRESHOLD and cooldown == 0:
+                if not recognized_sentence or dominant_label != recognized_sentence[-1]:
+                    recognized_sentence.append(dominant_label)
+                    print(f"✔ ACCEPTED: {dominant_label}")
 
                 dominance_counter.clear()
                 cooldown = COOLDOWN_FRAMES
@@ -144,7 +151,7 @@ while True:
     # ---------------- DISPLAY ----------------
     cv2.putText(frame, " ".join(recognized_sentence[-10:]),
                 (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                (255,255,0), 2)
+                (255, 255, 0), 2)
 
     cv2.imshow("Recognition", frame)
     if cv2.waitKey(1) & 0xFF == ord("q"):
