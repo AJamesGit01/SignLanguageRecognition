@@ -1,0 +1,34 @@
+Android Asset Export – Sign Language Recognition Model
+
+This script exports model metadata required for Android inference.
+
+Files generated:
+1. classes.txt
+   - A text file containing all gesture/gloss class names
+   - One class per line
+   - Used by the Android app to map model output indices to gloss labels
+
+2. norm_mean.bin
+   - Binary file (float32) containing the feature-wise mean
+   - Flattened array used for input normalization
+   - Must be applied before inference
+
+3. norm_std.bin
+   - Binary file (float32) containing the feature-wise standard deviation
+   - Flattened array used for input normalization
+
+Purpose:
+These files ensure that Android inference uses the exact same
+normalization statistics and label mapping as the Python training pipeline.
+
+Usage in Android:
+- Place all files inside the app’s assets folder
+- Load classes.txt as a list of strings
+- Load norm_mean.bin and norm_std.bin as FloatArray (Little Endian)
+- Normalize input as: (input - mean) / std
+
+Important:
+- This export step is required only once per trained model
+- Re-export is needed only if the model is retrained or classes change
+
+Author: Expressora – Sign Language Recognition System
