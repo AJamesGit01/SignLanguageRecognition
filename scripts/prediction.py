@@ -18,24 +18,36 @@ DOMINANCE_THRESHOLD = 12
 # =============================================
 BASE = r"C:\Users\JamJayDatuin\Documents\Machine Learning Projects\SignLanguageRecognition\models"
 
-MODEL_PATH   = f"{BASE}\\Sign_Model.keras"
+TFLITE_PATH  = f"{BASE}\\Sign_Model.tflite"
 CLASSES_PATH = f"{BASE}\\classes.npy"
 MEAN_PATH    = f"{BASE}\\norm_mean.npy"
 STD_PATH     = f"{BASE}\\norm_std.npy"
 
 # =============================================
-# LOAD MODEL + METADATA
+# LOAD METADATA
 # =============================================
-model = tf.keras.models.load_model(MODEL_PATH)
 classes = np.load(CLASSES_PATH, allow_pickle=True)
-mean = np.load(MEAN_PATH)
-std = np.load(STD_PATH)
+mean = np.load(MEAN_PATH).astype(np.float32)
+std  = np.load(STD_PATH).astype(np.float32)
 
 # =============================================
-# MEDIAPIPE
+# LOAD TFLITE MODEL (ONCE)
+# =============================================
+interpreter = tf.lite.Interpreter(model_path=TFLITE_PATH)
+interpreter.allocate_tensors()
+
+input_details  = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+print("✅ Input shape:", input_details[0]["shape"])
+print("✅ Input dtype:", input_details[0]["dtype"])
+
+# =============================================
+# MEDIAPIPE HANDS
 # =============================================
 mp_hands = mp.solutions.hands
 mp_draw  = mp.solutions.drawing_utils
+
 hands = mp_hands.Hands(
     max_num_hands=2,
     min_detection_confidence=0.5,
@@ -49,27 +61,30 @@ sequence = deque(maxlen=SEQ_LEN)
 prev_pos = None
 
 recognized_sentence = []
+dominance_counter = {}
 cooldown = 0
 frame_count = 0
-dominance_counter = {}
 
 cap = cv2.VideoCapture(0)
 
 # =============================================
-# PREDICT FUNCTION (252 FEATURES)
+# TFLITE PREDICTION FUNCTION
 # =============================================
 def predict_label(window):
-    arr = np.array(window, dtype=np.float32)
-    arr = arr.reshape(1, SEQ_LEN, 252)
+    arr = np.array(window, dtype=np.float32).reshape(1, SEQ_LEN, 252)
     arr = (arr - mean) / std
-    probs = model.predict(arr, verbose=0)[0]
+
+    interpreter.set_tensor(input_details[0]["index"], arr)
+    interpreter.invoke()
+    probs = interpreter.get_tensor(output_details[0]["index"])[0]
+
     idx = np.argmax(probs)
     return classes[idx], float(probs[idx])
 
 # =============================================
 # REAL-TIME LOOP
 # =============================================
-print("🎥 Stable Dominance Prediction Running...")
+print("🎥 TFLite Dominance-Based Prediction Running...")
 
 while True:
     ret, frame = cap.read()
@@ -80,10 +95,9 @@ while True:
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(rgb)
 
-    left = np.zeros(63, dtype=np.float32)
+    left  = np.zeros(63, dtype=np.float32)
     right = np.zeros(63, dtype=np.float32)
 
-    # ---------------- NO HANDS ----------------
     if not results.multi_hand_landmarks:
         prev_pos = None
         cooldown = max(0, cooldown - 1)
@@ -95,12 +109,9 @@ while True:
             break
         continue
 
-    # ---------------- LANDMARK EXTRACTION ----------------
     for i, hand in enumerate(results.multi_hand_landmarks):
         label = results.multi_handedness[i].classification[0].label.lower()
-        coords = []
-        for lm in hand.landmark:
-            coords.extend([lm.x, lm.y, lm.z])
+        coords = np.array([[lm.x, lm.y, lm.z] for lm in hand.landmark]).flatten()
 
         if label == "left":
             left[:] = coords
@@ -109,23 +120,16 @@ while True:
 
         mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
 
-    pos = np.concatenate([left, right])  # 126
+    pos = np.concatenate([left, right])
 
-    # ---------------- VELOCITY ----------------
-    if prev_pos is None:
-        vel = np.zeros_like(pos)
-    else:
-        vel = pos - prev_pos
-
+    vel = np.zeros_like(pos) if prev_pos is None else pos - prev_pos
     prev_pos = pos.copy()
 
-    full_feat = np.concatenate([pos, vel])  # 252
-    sequence.append(full_feat)
+    sequence.append(np.concatenate([pos, vel]))
 
     frame_count += 1
     cooldown = max(0, cooldown - 1)
 
-    # ---------------- PREDICTION ----------------
     if len(sequence) == SEQ_LEN and frame_count % PREDICT_EVERY == 0:
         label, conf = predict_label(sequence)
 
@@ -136,12 +140,11 @@ while True:
             if dominance_counter[dominant] >= DOMINANCE_THRESHOLD and cooldown == 0:
                 if not recognized_sentence or dominant != recognized_sentence[-1]:
                     recognized_sentence.append(dominant)
-                    print(f"✔ ACCEPTED: {dominant}")
+                    print("✔ ACCEPTED:", dominant)
 
                 dominance_counter.clear()
                 cooldown = COOLDOWN_FRAMES
 
-    # ---------------- DISPLAY ----------------
     cv2.putText(frame, " ".join(recognized_sentence[-10:]),
                 (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1,
                 (255,255,0), 2)
