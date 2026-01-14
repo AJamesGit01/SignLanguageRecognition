@@ -1,9 +1,13 @@
 import cv2
+import time
 import numpy as np
 import mediapipe as mp
 import tensorflow as tf
+from pathlib import Path
 from collections import deque
-import base64
+from queue import Queue, Empty
+from flask import Flask, Response, jsonify, make_response
+import threading
 
 # =============================================
 # CONFIG
@@ -17,24 +21,68 @@ DOMINANCE_THRESHOLD = 12
 # =============================================
 # PATHS
 # =============================================
-BASE = r"C:\Users\JamJayDatuin\Documents\Machine Learning Projects\SignLanguageRecognition\models"
+BASE_DIR = Path(__file__).resolve().parents[1]
+MODELS_DIR = BASE_DIR / "models"
 
-TFLITE_PATH  = f"{BASE}\\Sign_Model.tflite"
-CLASSES_PATH = f"{BASE}\\classes.npy"
-MEAN_PATH    = f"{BASE}\\norm_mean.npy"
-STD_PATH     = f"{BASE}\\norm_std.npy"
+TFLITE_PATH  = MODELS_DIR / "Sign_Model.tflite"
+CLASSES_PATH = MODELS_DIR / "classes.npy"
+MEAN_PATH    = MODELS_DIR / "norm_mean.npy"
+STD_PATH     = MODELS_DIR / "norm_std.npy"
+
+# =============================================
+# FLASK MJPEG STREAM
+# =============================================
+app = Flask(__name__)
+jpeg_frame = None
+jpeg_lock = threading.Lock()
+latest_frame = None
+frame_lock = threading.Lock()
+preview_frame = None
+preview_lock = threading.Lock()
+frame_queue = Queue(maxsize=1)
+accepted_label = ""
+accepted_lock = threading.Lock()
+
+
+def mjpeg_stream():
+    boundary = b"--frame\r\n"
+    while True:
+        with jpeg_lock:
+            frame = jpeg_frame
+        if frame is not None:
+            yield boundary + b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+        time.sleep(0.03)
+
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(
+        mjpeg_stream(),
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+
+@app.route("/accepted_label")
+def accepted_label_endpoint():
+    with accepted_lock:
+        label = accepted_label
+    resp = make_response(jsonify({"label": label}))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 # =============================================
 # LOAD METADATA
 # =============================================
-classes = np.load(CLASSES_PATH, allow_pickle=True)
-mean = np.load(MEAN_PATH).astype(np.float32)
-std  = np.load(STD_PATH).astype(np.float32)
+classes = np.load(str(CLASSES_PATH), allow_pickle=True)
+mean = np.load(str(MEAN_PATH)).astype(np.float32)
+std  = np.load(str(STD_PATH)).astype(np.float32)
 
 # =============================================
 # LOAD TFLITE MODEL (ONCE)
 # =============================================
-interpreter = tf.lite.Interpreter(model_path=TFLITE_PATH)
+interpreter = tf.lite.Interpreter(model_path=str(TFLITE_PATH))
 interpreter.allocate_tensors()
 
 input_details  = interpreter.get_input_details()
@@ -59,83 +107,164 @@ class Recognizer:
         self.cooldown = 0
         self.frame_count = 0
 
-    def predict_label(self, window):
-        arr = np.array(window, dtype=np.float32).reshape(1, SEQ_LEN, 252)
-        arr = (arr - mean) / std
-        interpreter.set_tensor(input_details[0]["index"], arr)
-        interpreter.invoke()
-        probs = interpreter.get_tensor(output_details[0]["index"])[0]
-        idx = np.argmax(probs)
-        return classes[idx], float(probs[idx])
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+cap.set(cv2.CAP_PROP_FPS, 30)
 
-    def process_frame(self, frame_bgr):
-        frame = cv2.flip(frame_bgr, 1)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.hands.process(rgb)
-        left = np.zeros(63, dtype=np.float32)
-        right = np.zeros(63, dtype=np.float32)
-        if not results.multi_hand_landmarks:
-            self.prev_pos = None
-            self.cooldown = max(0, self.cooldown - 1)
-            self.frame_count += 1
-            return None
-        for i, hand in enumerate(results.multi_hand_landmarks):
-            label = results.multi_handedness[i].classification[0].label.lower()
-            coords = np.array([[lm.x, lm.y, lm.z] for lm in hand.landmark]).flatten()
-            if label == "left":
-                left[:] = coords
-            else:
-                right[:] = coords
-        pos = np.concatenate([left, right])
-        vel = np.zeros_like(pos) if self.prev_pos is None else pos - self.prev_pos
-        self.prev_pos = pos.copy()
-        self.sequence.append(np.concatenate([pos, vel]))
-        self.frame_count += 1
-        self.cooldown = max(0, self.cooldown - 1)
-        accepted = None
-        if len(self.sequence) == SEQ_LEN and self.frame_count % PREDICT_EVERY == 0:
-            label, conf = self.predict_label(self.sequence)
-            if conf >= CONF_THRESHOLD:
-                self.dominance_counter[label] = self.dominance_counter.get(label, 0) + 1
-                dominant = max(self.dominance_counter, key=self.dominance_counter.get)
-                if self.dominance_counter[dominant] >= DOMINANCE_THRESHOLD and self.cooldown == 0:
-                    if not self.recognized_sentence or dominant != self.recognized_sentence[-1]:
-                        self.recognized_sentence.append(dominant)
-                        accepted = dominant
-                    self.dominance_counter.clear()
-                    self.cooldown = COOLDOWN_FRAMES
-        return accepted
+# Start MJPEG server in a background thread
+threading.Thread(
+    target=lambda: app.run(host="0.0.0.0", port=5000, debug=False, threaded=True, use_reloader=False),
+    daemon=True
+).start()
 
-    def get_sentence(self):
-        return list(self.recognized_sentence)
 
-    def reset(self):
-        self.sequence.clear()
-        self.prev_pos = None
-        self.recognized_sentence = []
-        self.dominance_counter = {}
-        self.cooldown = 0
-        self.frame_count = 0
-
-def _run_webcam():
-    recog = Recognizer()
-    cap = cv2.VideoCapture(0)
-    print("🎥 TFLite Dominance-Based Prediction Running...")
+def capture_loop():
+    global latest_frame
     while True:
         ret, frame = cap.read()
         if not ret:
-            break
-        accepted = recog.process_frame(frame)
-        if accepted is not None:
-            print("✔ ACCEPTED:", accepted)
-        cv2.putText(frame, " ".join(recog.get_sentence()[-10:]), (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,0), 2)
+            time.sleep(0.01)
+            continue
+        frame = cv2.flip(frame, 1)
+        with frame_lock:
+            latest_frame = frame
+        if frame_queue.full():
+            try:
+                frame_queue.get_nowait()
+            except Empty:
+                pass
+        try:
+            frame_queue.put_nowait(frame)
+        except Exception:
+            pass
+
+
+def stream_loop():
+    global jpeg_frame
+    while True:
+        with preview_lock:
+            frame = None if preview_frame is None else preview_frame.copy()
+        if frame is None:
+            with frame_lock:
+                frame = None if latest_frame is None else latest_frame.copy()
+        if frame is None:
+            time.sleep(0.01)
+            continue
+
+        stream_frame = cv2.resize(frame, (640, 480))
+        ret, jpeg = cv2.imencode(
+            ".jpg",
+            stream_frame,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 70],
+        )
+        if ret:
+            with jpeg_lock:
+                jpeg_frame = jpeg.tobytes()
+        time.sleep(0.01)
+
+
+threading.Thread(target=capture_loop, daemon=True).start()
+threading.Thread(target=stream_loop, daemon=True).start()
+
+# =============================================
+# TFLITE PREDICTION FUNCTION
+# =============================================
+def predict_label(window):
+    arr = np.array(window, dtype=np.float32).reshape(1, SEQ_LEN, 252)
+    arr = (arr - mean) / std
+
+    interpreter.set_tensor(input_details[0]["index"], arr)
+    interpreter.invoke()
+    probs = interpreter.get_tensor(output_details[0]["index"])[0]
+
+    idx = np.argmax(probs)
+    return classes[idx], float(probs[idx])
+
+# =============================================
+# REAL-TIME LOOP
+# =============================================
+print("🎥 TFLite Dominance-Based Prediction Running...")
+
+while True:
+    try:
+        frame = frame_queue.get_nowait()
+    except Empty:
+        time.sleep(0.01)
+        continue
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb)
+
+    left  = np.zeros(63, dtype=np.float32)
+    right = np.zeros(63, dtype=np.float32)
+
+    if not results.multi_hand_landmarks:
+        prev_pos = None
+        cooldown = max(0, cooldown - 1)
+
+        cv2.putText(frame, "No Hands", (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+
+        # Update preview frame for MJPEG stream even when no hands are detected
+        with preview_lock:
+            preview_frame = frame.copy()
+
         cv2.imshow("Recognition", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
-    cap.release()
-    cv2.destroyAllWindows()
-    print("\nFINAL GLOSS SEQUENCE:")
-    print(recog.get_sentence())
+        continue
 
-if __name__ == "__main__":
-    _run_webcam()
+    for i, hand in enumerate(results.multi_hand_landmarks):
+        label = results.multi_handedness[i].classification[0].label.lower()
+        coords = np.array([[lm.x, lm.y, lm.z] for lm in hand.landmark]).flatten()
+
+        if label == "left":
+            left[:] = coords
+        else:
+            right[:] = coords
+
+        mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
+
+    pos = np.concatenate([left, right])
+
+    vel = np.zeros_like(pos) if prev_pos is None else pos - prev_pos
+    prev_pos = pos.copy()
+
+    sequence.append(np.concatenate([pos, vel]))
+
+    frame_count += 1
+    cooldown = max(0, cooldown - 1)
+
+    if len(sequence) == SEQ_LEN and frame_count % PREDICT_EVERY == 0:
+        label, conf = predict_label(sequence)
+
+        if conf >= CONF_THRESHOLD:
+            dominance_counter[label] = dominance_counter.get(label, 0) + 1
+            dominant = max(dominance_counter, key=dominance_counter.get)
+
+            if dominance_counter[dominant] >= DOMINANCE_THRESHOLD and cooldown == 0:
+                if not recognized_sentence or dominant != recognized_sentence[-1]:
+                    recognized_sentence.append(dominant)
+                    print("✔ ACCEPTED:", dominant)
+                    with accepted_lock:
+                        accepted_label = dominant
+
+                dominance_counter.clear()
+                cooldown = COOLDOWN_FRAMES
+
+    cv2.putText(frame, " ".join(recognized_sentence[-10:]),
+                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                (255,255,0), 2)
+
+    # Update preview frame for MJPEG stream (includes landmarks + text)
+    with preview_lock:
+        preview_frame = frame.copy()
+
+    cv2.imshow("Recognition", frame)
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+
+print("\nFINAL GLOSS SEQUENCE:")
+print(recognized_sentence)
