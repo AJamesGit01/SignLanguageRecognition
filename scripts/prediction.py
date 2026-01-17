@@ -253,10 +253,6 @@ while True:
                 rec.dominance_counter.clear()
                 rec.cooldown = COOLDOWN_FRAMES
 
-    cv2.putText(frame, " ".join(rec.recognized_sentence[-10:]),
-                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                (255,255,0), 2)
-
     with preview_lock:
         preview_frame = frame.copy()
 
