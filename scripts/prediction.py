@@ -180,6 +180,8 @@ def predict_label(window):
     idx = np.argmax(probs)
     return classes[idx], float(probs[idx])
 
+rec = Recognizer()
+
 # =============================================
 # REAL-TIME LOOP
 # =============================================
@@ -191,20 +193,20 @@ while True:
     except Empty:
         time.sleep(0.01)
         continue
+
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(rgb)
+    results = rec.hands.process(rgb)
 
     left  = np.zeros(63, dtype=np.float32)
     right = np.zeros(63, dtype=np.float32)
 
     if not results.multi_hand_landmarks:
-        prev_pos = None
-        cooldown = max(0, cooldown - 1)
+        rec.prev_pos = None
+        rec.cooldown = max(0, rec.cooldown - 1)
 
         cv2.putText(frame, "No Hands", (10, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
 
-        # Update preview frame for MJPEG stream even when no hands are detected
         with preview_lock:
             preview_frame = frame.copy()
 
@@ -226,36 +228,35 @@ while True:
 
     pos = np.concatenate([left, right])
 
-    vel = np.zeros_like(pos) if prev_pos is None else pos - prev_pos
-    prev_pos = pos.copy()
+    vel = np.zeros_like(pos) if rec.prev_pos is None else pos - rec.prev_pos
+    rec.prev_pos = pos.copy()
 
-    sequence.append(np.concatenate([pos, vel]))
+    rec.sequence.append(np.concatenate([pos, vel]))
 
-    frame_count += 1
-    cooldown = max(0, cooldown - 1)
+    rec.frame_count += 1
+    rec.cooldown = max(0, rec.cooldown - 1)
 
-    if len(sequence) == SEQ_LEN and frame_count % PREDICT_EVERY == 0:
-        label, conf = predict_label(sequence)
+    if len(rec.sequence) == SEQ_LEN and rec.frame_count % PREDICT_EVERY == 0:
+        label, conf = predict_label(rec.sequence)
 
         if conf >= CONF_THRESHOLD:
-            dominance_counter[label] = dominance_counter.get(label, 0) + 1
-            dominant = max(dominance_counter, key=dominance_counter.get)
+            rec.dominance_counter[label] = rec.dominance_counter.get(label, 0) + 1
+            dominant = max(rec.dominance_counter, key=rec.dominance_counter.get)
 
-            if dominance_counter[dominant] >= DOMINANCE_THRESHOLD and cooldown == 0:
-                if not recognized_sentence or dominant != recognized_sentence[-1]:
-                    recognized_sentence.append(dominant)
+            if rec.dominance_counter[dominant] >= DOMINANCE_THRESHOLD and rec.cooldown == 0:
+                if not rec.recognized_sentence or dominant != rec.recognized_sentence[-1]:
+                    rec.recognized_sentence.append(dominant)
                     print("✔ ACCEPTED:", dominant)
                     with accepted_lock:
                         accepted_label = dominant
 
-                dominance_counter.clear()
-                cooldown = COOLDOWN_FRAMES
+                rec.dominance_counter.clear()
+                rec.cooldown = COOLDOWN_FRAMES
 
-    cv2.putText(frame, " ".join(recognized_sentence[-10:]),
+    cv2.putText(frame, " ".join(rec.recognized_sentence[-10:]),
                 (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1,
                 (255,255,0), 2)
 
-    # Update preview frame for MJPEG stream (includes landmarks + text)
     with preview_lock:
         preview_frame = frame.copy()
 
@@ -267,4 +268,4 @@ cap.release()
 cv2.destroyAllWindows()
 
 print("\nFINAL GLOSS SEQUENCE:")
-print(recognized_sentence)
+print(rec.recognized_sentence)
