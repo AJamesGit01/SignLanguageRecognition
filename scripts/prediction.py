@@ -40,8 +40,13 @@ frame_lock = threading.Lock()
 preview_frame = None
 preview_lock = threading.Lock()
 frame_queue = Queue(maxsize=1)
+
 accepted_label = ""
 accepted_lock = threading.Lock()
+
+# NEW: single-gloss display state (updates only when changed)
+current_gloss = ""
+current_gloss_lock = threading.Lock()
 
 
 def mjpeg_stream():
@@ -72,6 +77,19 @@ def accepted_label_endpoint():
     resp.headers["Expires"] = "0"
     return resp
 
+
+# Optional: also expose current gloss (if you ever want it on web UI)
+@app.route("/current_gloss")
+def current_gloss_endpoint():
+    with current_gloss_lock:
+        gloss = current_gloss
+    resp = make_response(jsonify({"gloss": gloss}))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
+
+
 # =============================================
 # LOAD METADATA
 # =============================================
@@ -99,13 +117,21 @@ mp_draw  = mp.solutions.drawing_utils
 
 class Recognizer:
     def __init__(self):
-        self.hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        self.hands = mp_hands.Hands(
+            max_num_hands=2,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
         self.sequence = deque(maxlen=SEQ_LEN)
         self.prev_pos = None
+
+        # sentence list no longer needed for GUI, but keep if you want logging history
         self.recognized_sentence = []
+
         self.dominance_counter = {}
         self.cooldown = 0
         self.frame_count = 0
+
 
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -125,14 +151,18 @@ def capture_loop():
         if not ret:
             time.sleep(0.01)
             continue
+
         frame = cv2.flip(frame, 1)
+
         with frame_lock:
             latest_frame = frame
+
         if frame_queue.full():
             try:
                 frame_queue.get_nowait()
             except Empty:
                 pass
+
         try:
             frame_queue.put_nowait(frame)
         except Exception:
@@ -144,9 +174,11 @@ def stream_loop():
     while True:
         with preview_lock:
             frame = None if preview_frame is None else preview_frame.copy()
+
         if frame is None:
             with frame_lock:
                 frame = None if latest_frame is None else latest_frame.copy()
+
         if frame is None:
             time.sleep(0.01)
             continue
@@ -160,6 +192,7 @@ def stream_loop():
         if ret:
             with jpeg_lock:
                 jpeg_frame = jpeg.tobytes()
+
         time.sleep(0.01)
 
 
@@ -179,6 +212,7 @@ def predict_label(window):
 
     idx = np.argmax(probs)
     return classes[idx], float(probs[idx])
+
 
 rec = Recognizer()
 
@@ -205,7 +239,15 @@ while True:
         rec.cooldown = max(0, rec.cooldown - 1)
 
         cv2.putText(frame, "No Hands", (10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+        # show last accepted gloss even if hands disappear (optional)
+        with current_gloss_lock:
+            display_text = current_gloss
+            current_gloss = ""
+
+        cv2.putText(frame, "No Hands", (10, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
         with preview_lock:
             preview_frame = frame.copy()
@@ -244,14 +286,31 @@ while True:
             dominant = max(rec.dominance_counter, key=rec.dominance_counter.get)
 
             if rec.dominance_counter[dominant] >= DOMINANCE_THRESHOLD and rec.cooldown == 0:
-                if not rec.recognized_sentence or dominant != rec.recognized_sentence[-1]:
+                # Update ONLY when gloss changes (reflect once per change)
+                with current_gloss_lock:
+                    changed = (dominant != current_gloss)
+
+                if changed:
+                    with current_gloss_lock:
+                        current_gloss = dominant
+
+                    # optional: keep history list if you still want it
                     rec.recognized_sentence.append(dominant)
+
                     print("✔ ACCEPTED:", dominant)
                     with accepted_lock:
                         accepted_label = dominant
 
                 rec.dominance_counter.clear()
                 rec.cooldown = COOLDOWN_FRAMES
+
+    # Draw the current gloss in GUI (single label, updates only on change)
+    with current_gloss_lock:
+        display_text = current_gloss
+
+    if display_text:
+        cv2.putText(frame, f"Sign: {display_text}", (10, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
     with preview_lock:
         preview_frame = frame.copy()
@@ -260,8 +319,9 @@ while True:
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
+
 cap.release()
 cv2.destroyAllWindows()
 
-print("\nFINAL GLOSS SEQUENCE:")
+print("\nFINAL ACCEPTED GLOSSES (change-only history):")
 print(rec.recognized_sentence)
